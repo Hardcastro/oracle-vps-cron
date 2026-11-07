@@ -1,0 +1,104 @@
+name: Criar VPS Oracle (tentativa automatica)
+
+# Roda a cada 20 minutos ate a VPS vps-waha-n8n existir.
+# Quando conseguir, abre uma Issue (voce recebe e-mail) e desliga este workflow sozinho.
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: criar-vps
+  cancel-in-progress: false
+
+env:
+  STACK_ID: ocid1.ormstack.oc1.sa-saopaulo-1.amaaaaaaxv62wgaacxul6qqiwqmqaxze4swdcsdh4krqkbaocbyoxyiapqka
+  INSTANCE_NAME: vps-waha-n8n
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+
+jobs:
+  tentar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Instalar OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configurar credenciais
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=~/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+          echo "TENANCY=$OCI_TENANCY" >> "$GITHUB_ENV"
+
+      - name: A VPS ja existe?
+        id: check
+        run: |
+          estado=$(oci compute instance list --compartment-id "$TENANCY" \
+            --display-name "$INSTANCE_NAME" --all \
+            --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | [0].\"lifecycle-state\"" \
+            --raw-output 2>/dev/null || true)
+          echo "Estado atual: ${estado:-nenhuma}"
+          if [ -n "$estado" ] && [ "$estado" != "null" ]; then
+            echo "existe=sim" >> "$GITHUB_OUTPUT"
+          else
+            echo "existe=nao" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rodar Apply da stack
+        id: apply
+        if: steps.check.outputs.existe == 'nao'
+        run: |
+          rodando=$(oci resource-manager job list --stack-id "$STACK_ID" --lifecycle-state IN_PROGRESS \
+            --query 'length(data)' --raw-output 2>/dev/null || echo 0)
+          if [ "${rodando:-0}" != "0" ]; then echo "Ja existe um job rodando; pulo esta rodada."; exit 0; fi
+          job=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" \
+            --execution-plan-strategy AUTO_APPROVED --display-name "auto-$(date -u +%Y%m%d-%H%M)" \
+            --query 'data.id' --raw-output)
+          echo "Job: $job"
+          for i in $(seq 1 60); do
+            st=$(oci resource-manager job get --job-id "$job" --query 'data."lifecycle-state"' --raw-output)
+            case "$st" in SUCCEEDED|FAILED|CANCELED) break;; esac
+            sleep 10
+          done
+          echo "Resultado: $st"
+          if [ "$st" = "SUCCEEDED" ]; then
+            echo "criada=sim" >> "$GITHUB_OUTPUT"
+          else
+            oci resource-manager job get-job-logs --job-id "$job" --all \
+              --query "data[?level=='ERROR'].message" --raw-output 2>/dev/null | head -5 || true
+            echo "Sem vaga ainda. Nova tentativa em ~20 min."
+          fi
+
+      - name: Avisar e desligar
+        if: steps.check.outputs.existe == 'sim' || steps.apply.outputs.criada == 'sim'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ip=$(oci compute instance list --compartment-id "$TENANCY" --display-name "$INSTANCE_NAME" \
+            --query 'data[0].id' --raw-output | xargs -I{} oci compute instance list-vnics --instance-id {} \
+            --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "VPS vps-waha-n8n criada!" \
+            --body "A VPS foi criada na Oracle (Sao Paulo). IP publico: ${ip:-ainda sem IP publico}. Volte ao Claude e diga: vps criada." || true
+          gh workflow disable "criar-vps.yml" --repo "$GITHUB_REPOSITORY"
